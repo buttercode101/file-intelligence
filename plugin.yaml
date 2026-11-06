@@ -1,0 +1,11 @@
+name: file-intelligence
+version: 0.1.0
+requires_hermes: ">=0.22.0"
+description: "File Intelligence for Hermes - proactive scanner that finds duplicates, large files and sensitive items, then proposes ranked safe cleanup actions in Desktop. Dry-run by default; every mutation requires explicit approval via agent tools. No silent tracking, moving or deleting. Distinct from bundled disk-cleanup (silent test-file tracking) and file-tray/filebox (tracking/browser)."
+author: Rama (Loopii)
+provides_tools:
+  - file_scan
+  - file_propose
+  - file_apply
+provides_hooks:
+  - post_tool_call
