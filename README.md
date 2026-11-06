@@ -17,15 +17,15 @@ Proactive file scanning and actionable proposals for Hermes — finds duplicates
 - `post_tool_call` — audit observer for `file_apply` only, fail-open
 
 ## Desktop
-- Timeline pane (read-only): scan summary, duplicate clusters, sensitivity flags, proposal cards
+- Timeline pane: **static entry point** (read-only). It does not yet fetch `/proposals` — scan/proposal results are returned as tool output from `file_scan`/`file_propose` in chat. Backend `GET /status|proposals|audit` endpoints exist for future UI wiring.
 - Status-bar chip
 - Backend: `GET /api/plugins/file-intelligence/status|proposals|audit` — **read-only**. Mutations only via agent tools so approvals fire.
 
 ## Storage
-SQLite in `ctx.state.data_dir` (`file_intelligence.db`), WAL, schema v1. **Metadata only (path, size, hash-prefix) — never file content.** Audit capped at 10k rows.
+SQLite in `ctx.state.data_dir` (`file_intelligence.db`), WAL, schema v1. **Metadata only (path, size, SHA-256 hash) — never file content.** Audit capped at 10k rows.
 
 ## Disclosure —
-- Scans a user-specified directory (stat + SHA-256 hash of contents in 1MB chunks; files >1GB skipped for hashing with warning)
+- Scans a user-specified directory (stat + full SHA-256 hash of contents in 1MB chunks for duplicate detection; files >1GB skipped for hashing with warning; **sensitive files are never hashed**). Hidden directories (dot-dirs) are excluded wholesale; hidden files at the scanned root (e.g. `.env`) are included and flagged sensitive
 - Reads only file metadata and content for hashing; stores no file content
 - `file_apply` with `dry_run=false` renames files into `<root>/.file-intelligence-archive/` (reversible archive, same filesystem)
 - Sensitive files (`.env`, `*.pem`, `*.key`, `id_rsa`, etc.) are flagged only and **never moved**

@@ -16,11 +16,11 @@ if _plugin_dir not in sys.path:
 
 try:
     from .storage import init_db, open_db, prune
-    from .scanner import scan as _scan
+    from .scanner import scan as _scan, is_sensitive_path
     from .proposals import build_proposals
 except ImportError:
     from storage import init_db, open_db, prune
-    from scanner import scan as _scan
+    from scanner import scan as _scan, is_sensitive_path
     from proposals import build_proposals
 
 _ctx = None
@@ -56,7 +56,8 @@ def handle_scan(args=None, **kw):
     conn = _db()
     try:
         conn.execute("INSERT INTO scans(scan_id,root,created_at,file_count,total_bytes,status) VALUES(?,?,?,?,?,?)",
-                     (scan_id, root, _now(), len(result["files"]), result["total_bytes"], "complete"))
+                     (scan_id, root, _now(), len(result["files"]), result["total_bytes"], "truncated" if result["truncated"] else "complete"))
+        conn.execute("INSERT INTO scan_files(scan_id,files_json) VALUES(?,?)", (scan_id, json.dumps(result["files"])))
         conn.commit()
     finally: conn.close()
     _audit("scan", f"{scan_id} root={root} files={len(result['files'])} bytes={result['total_bytes']}")
@@ -67,14 +68,34 @@ def handle_scan(args=None, **kw):
 
 def handle_propose(args=None, **kw):
     args = args or {}
-    # Re-scan root to build proposals (stateless, no content stored)
+    scan_id = args.get("scan_id") or ""
     root = args.get("root") or ""
-    if not root:
-        return json.dumps({"ok": False, "error": "root is required"})
-    result = _scan(root, max_depth=int(args.get("max_depth") or 6))
-    if not result.get("ok"):
-        return json.dumps(result)
-    proposals = build_proposals(result["files"])
+    files = None
+    truncated = False
+    if scan_id:
+        conn = _db()
+        try:
+            row = conn.execute("SELECT root,status FROM scans WHERE scan_id=?", (scan_id,)).fetchone()
+            if not row:
+                return json.dumps({"ok": False, "error": f"unknown scan_id {scan_id!r} — run file_scan first"})
+            if root and str(row["root"]) != str(root):
+                return json.dumps({"ok": False, "error": f"scan_id {scan_id!r} root {row['root']!r} does not match requested root {root!r}"})
+            root = row["root"]
+            truncated = (row["status"] == "truncated")
+            sf = conn.execute("SELECT files_json FROM scan_files WHERE scan_id=?", (scan_id,)).fetchone()
+            if not sf:
+                return json.dumps({"ok": False, "error": f"scan {scan_id!r} has no stored files — re-run file_scan"})
+            files = json.loads(sf["files_json"])
+        finally: conn.close()
+    else:
+        if not root:
+            return json.dumps({"ok": False, "error": "root or scan_id is required"})
+        result = _scan(root, max_depth=int(args.get("max_depth") or 6), ignore=args.get("ignore") or [])
+        if not result.get("ok"):
+            return json.dumps(result)
+        files = result["files"]
+        truncated = bool(result.get("truncated"))
+    proposals = build_proposals(files)
     conn = _db()
     try:
         for p in proposals:
@@ -84,7 +105,7 @@ def handle_propose(args=None, **kw):
         conn.commit()
     finally: conn.close()
     _audit("propose", f"root={root} proposals={len(proposals)} reclaimable={sum(p['reclaimable_bytes'] for p in proposals)}")
-    return json.dumps({"ok": True, "proposals": proposals, "reclaimable_bytes": sum(p["reclaimable_bytes"] for p in proposals)})
+    return json.dumps({"ok": True, "proposals": proposals, "reclaimable_bytes": sum(p["reclaimable_bytes"] for p in proposals), "truncated": truncated, "warning": "scan truncated at 10k files — proposals cover partial scan only" if truncated else None})
 
 def handle_apply(args=None, **kw):
     """Dry-run default. Real apply requires dry_run=false AND goes through approval (tool path).
@@ -96,30 +117,69 @@ def handle_apply(args=None, **kw):
     root = args.get("root") or ""
     if not paths:
         return json.dumps({"ok": False, "error": "paths[] is required"})
-    # Refuse sensitive
+    # Shared sensitive policy (same as scanner) — refuse before any IO
     for p in paths:
-        name = Path(p).name.lower()
-        if name.startswith(".env") or name.endswith((".pem",".key",".p12",".pfx")) or name in ("id_rsa","id_ed25519"):
+        if is_sensitive_path(p):
             return json.dumps({"ok": False, "error": f"refused: sensitive path flagged only, never moved: {p}"})
+    # P0 containment: root required, canonicalized
+    if not root:
+        return json.dumps({"ok": False, "error": "root is required for archive containment"})
+    root_resolved = Path(root).expanduser().resolve()
+    if not root_resolved.is_dir():
+        return json.dumps({"ok": False, "error": f"root not a directory: {root}"})
+    archive_root = root_resolved / ".file-intelligence-archive"
+    # Archive dir must not be a symlink (created later, validated at rename time too)
+    if archive_root.is_symlink():
+        return json.dumps({"ok": False, "error": "refused: archive directory is a symlink"})
+    for p in paths:
+        try:
+            rp = Path(p).expanduser().resolve()
+        except Exception as e:
+            return json.dumps({"ok": False, "error": f"cannot resolve path {p!r}: {e}"})
+        # Must be inside root, not root itself, not inside archive dir
+        try:
+            rp.relative_to(root_resolved)
+        except ValueError:
+            return json.dumps({"ok": False, "error": f"refused: path outside scan root: {p}"})
+        if rp == root_resolved:
+            return json.dumps({"ok": False, "error": f"refused: path is root itself: {p}"})
+        try:
+            rp.relative_to(archive_root)
+            return json.dumps({"ok": False, "error": f"refused: path already inside archive dir: {p}"})
+        except ValueError:
+            pass
+        # Reject symlinked source (resolve() already followed it, but original must not be symlink)
+        if Path(p).expanduser().is_symlink():
+            return json.dumps({"ok": False, "error": f"refused: source is a symlink: {p}"})
     if dry_run:
         _audit("apply_dry_run", f"paths={len(paths)}")
         return json.dumps({"ok": True, "dry_run": True, "would_archive": paths, "note": "dry-run only — no files moved. Set dry_run=false via agent tool (approval required) to apply."})
-    # Real apply: archive via rename
-    archive_root = Path(root) / ".file-intelligence-archive" if root else None
+    # Real apply: archive via rename, re-validated immediately before each rename
     results = []
     for src in paths:
         sp = Path(src).expanduser()
         try:
-            if not sp.exists():
-                results.append({"path": src, "ok": False, "error": "not found"}); continue
-            if archive_root is None:
-                results.append({"path": src, "ok": False, "error": "root required for archive target"}); continue
+            # Re-check containment at rename time (TOCTOU mitigation)
+            rp = sp.resolve()
+            rp.relative_to(root_resolved)
+            if sp.is_symlink() or archive_root.is_symlink():
+                results.append({"path": src, "ok": False, "error": "symlink detected at rename time — refused"}); continue
+            if not sp.exists() or not sp.is_file():
+                results.append({"path": src, "ok": False, "error": "not found or not a file"}); continue
             archive_root.mkdir(parents=True, exist_ok=True)
+            # Archive dir created — re-check it is not a symlink and is inside root
+            if archive_root.is_symlink():
+                results.append({"path": src, "ok": False, "error": "archive dir is a symlink — refused"}); continue
+            archive_root.resolve().relative_to(root_resolved)
             dest = archive_root / sp.name
             if dest.exists():
                 dest = archive_root / f"{sp.stem}_{uuid.uuid4().hex[:6]}{sp.suffix}"
+            # Dest must be inside archive_root
+            dest.resolve().parent.resolve().relative_to(archive_root.resolve())
             sp.rename(dest)
             results.append({"path": src, "ok": True, "archived_to": str(dest)})
+        except ValueError:
+            results.append({"path": src, "ok": False, "error": "path outside root at rename time — refused"})
         except OSError as e:
             results.append({"path": src, "ok": False, "error": str(e)})
     _audit("apply", f"paths={len(paths)} results={json.dumps(results)[:400]}")
