@@ -25,6 +25,7 @@ def init_db(conn):
           proposal_id TEXT PRIMARY KEY, scan_id TEXT, kind TEXT, risk TEXT,
           paths TEXT, reclaimable_bytes INT, status TEXT, created_at TEXT
         );
+        CREATE TABLE IF NOT EXISTS scan_files(scan_id TEXT PRIMARY KEY, files_json TEXT);
         CREATE TABLE IF NOT EXISTS audit(
           id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, action TEXT, detail TEXT
         );
